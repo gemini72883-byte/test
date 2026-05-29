@@ -10,18 +10,29 @@ import crypto from "crypto";
 
 const app = express();
 const upload = multer({ dest: "/tmp/uploads" });
-const jobs = new Map<string, any>();
+
+type Job = {
+  logs: string[];
+  done: boolean;
+  failed: boolean;
+  artifact: string | null;
+};
+
+const jobs = new Map<string, Job>();
 
 app.post("/compile", upload.single("project"), async (req, res) => {
-  const entry = req.body.entry;
+  if (!req.file) return res.status(400).send("Missing project zip");
+  if (!req.body.entry) return res.status(400).send("Missing entry file");
+
   const id = crypto.randomUUID();
+  const entry = req.body.entry;
 
   const workdir = `/tmp/job-${id}`;
   const outdir = `${workdir}/dist`;
 
   fs.mkdirSync(workdir, { recursive: true });
 
-  await fs.createReadStream(req.file!.path)
+  await fs.createReadStream(req.file.path)
     .pipe(unzipper.Extract({ path: workdir }))
     .promise();
 
@@ -32,22 +43,30 @@ app.post("/compile", upload.single("project"), async (req, res) => {
     artifact: null
   });
 
+  const job = jobs.get(id)!;
+
   const child = spawn("python", [
-    "-m", "nuitka",
+    "-m",
+    "nuitka",
     "--standalone",
     "--onefile",
+    "--jobs=1",
     `--output-dir=${outdir}`,
     entry
   ], {
     cwd: workdir,
-    shell: false
+    shell: false,
+    env: {
+      ...process.env,
+      CFLAGS: "-O0",
+      CXXFLAGS: "-O0"
+    }
   });
 
-  child.stdout.on("data", d => jobs.get(id).logs.push(d.toString()));
-  child.stderr.on("data", d => jobs.get(id).logs.push(d.toString()));
+  child.stdout.on("data", d => job.logs.push(d.toString()));
+  child.stderr.on("data", d => job.logs.push(d.toString()));
 
   child.on("close", async code => {
-    const job = jobs.get(id);
     job.done = true;
     job.failed = code !== 0;
 
@@ -61,6 +80,9 @@ app.post("/compile", upload.single("project"), async (req, res) => {
       await archive.finalize();
 
       job.artifact = zipPath;
+      job.logs.push("\n[DONE]\n");
+    } else {
+      job.logs.push("\n[FAILED]\n");
     }
   });
 
@@ -73,11 +95,14 @@ app.get("/download/:id", (req, res) => {
   if (!job) return res.status(404).send("Job not found");
   if (!job.done) return res.status(400).send("Still compiling");
   if (job.failed) return res.status(500).send("Compilation failed");
+  if (!job.artifact) return res.status(404).send("Artifact missing");
 
   res.download(job.artifact, "compiled-result.zip");
 });
 
-const server = app.listen(process.env.PORT || 3000);
+const server = app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running");
+});
 
 const wss = new WebSocketServer({ server });
 
@@ -87,14 +112,18 @@ wss.on("connection", (ws, req) => {
 
   const interval = setInterval(() => {
     const job = jobs.get(id);
-    if (!job) return;
+
+    if (!job) {
+      ws.send("Job not found");
+      clearInterval(interval);
+      return ws.close();
+    }
 
     while (job.logs.length) {
-      ws.send(job.logs.shift());
+      ws.send(job.logs.shift()!);
     }
 
     if (job.done) {
-      ws.send(job.failed ? "\n[FAILED]" : "\n[DONE]");
       clearInterval(interval);
       ws.close();
     }
