@@ -6,7 +6,6 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import archiver = require("archiver");
 
 const app = express();
 
@@ -43,18 +42,22 @@ function safeEntry(entry: string) {
   return entry;
 }
 
-async function zipDirectory(sourceDir: string, outputZip: string) {
+async function zipDirectory(sourceDir: string, outputZip: string, job: Job) {
   return new Promise<void>((resolve, reject) => {
-    const output = fs.createWriteStream(outputZip);
-    const archive = archiver("zip", { zlib: { level: 6 } });
+    const child = spawn("zip", ["-r", outputZip, "."], {
+      cwd: sourceDir,
+      shell: false
+    });
 
-    output.on("close", () => resolve());
-    output.on("error", reject);
-    archive.on("error", reject);
+    child.stdout.on("data", d => log(job, d.toString()));
+    child.stderr.on("data", d => log(job, d.toString()));
 
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    archive.finalize();
+    child.on("error", reject);
+
+    child.on("close", code => {
+      if (code === 0) resolve();
+      else reject(new Error(`zip exited with code ${code}`));
+    });
   });
 }
 
@@ -154,7 +157,7 @@ app.post("/compile", upload.single("project"), async (req, res) => {
           log(job!, `[FAILED] Nuitka exited with code ${code}`);
         } else {
           log(job!, "[ZIPPING ARTIFACT]");
-          await zipDirectory(outdir, artifact);
+         await zipDirectory(outdir, artifact, job!);
           job!.artifact = artifact;
           log(job!, "[DONE]");
         }
