@@ -1,18 +1,19 @@
 import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
-import archiver from "archiver";
 import { spawn } from "child_process";
 import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import archiver = require("archiver");
 
 const app = express();
+
 const upload = multer({
   dest: "/tmp/uploads",
   limits: {
-    fileSize: 200 * 1024 * 1024
+    fileSize: 300 * 1024 * 1024
   }
 });
 
@@ -27,19 +28,28 @@ type Job = {
 
 const jobs = new Map<string, Job>();
 
+function log(job: Job, msg: string) {
+  job.logs.push(msg.endsWith("\n") ? msg : msg + "\n");
+}
+
 function safeEntry(entry: string) {
-  if (entry.includes("..")) throw new Error("Invalid entry path");
-  if (entry.startsWith("/")) throw new Error("Invalid entry path");
+  entry = entry.trim();
+
+  if (!entry) throw new Error("Missing entry");
   if (!entry.endsWith(".py")) throw new Error("Entry must be a .py file");
+  if (entry.includes("..")) throw new Error("Entry cannot contain ..");
+  if (path.isAbsolute(entry)) throw new Error("Entry cannot be absolute path");
+
   return entry;
 }
 
 async function zipDirectory(sourceDir: string, outputZip: string) {
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     const output = fs.createWriteStream(outputZip);
     const archive = archiver("zip", { zlib: { level: 6 } });
 
     output.on("close", () => resolve());
+    output.on("error", reject);
     archive.on("error", reject);
 
     archive.pipe(output);
@@ -49,6 +59,8 @@ async function zipDirectory(sourceDir: string, outputZip: string) {
 }
 
 app.post("/compile", upload.single("project"), async (req, res) => {
+  let job: Job | null = null;
+
   try {
     if (!req.file) return res.status(400).send("Missing project zip");
     if (!req.body.entry) return res.status(400).send("Missing entry file");
@@ -64,7 +76,7 @@ app.post("/compile", upload.single("project"), async (req, res) => {
     fs.mkdirSync(workdir, { recursive: true });
     fs.mkdirSync(outdir, { recursive: true });
 
-    const job: Job = {
+    job = {
       id,
       logs: [],
       done: false,
@@ -75,21 +87,23 @@ app.post("/compile", upload.single("project"), async (req, res) => {
 
     jobs.set(id, job);
 
-    job.logs.push(`[JOB ${id}]\n`);
-    job.logs.push(`[MODE ${mode}]\n`);
-    job.logs.push(`[ENTRY ${entry}]\n`);
-    job.logs.push("[EXTRACTING ZIP]\n");
+    log(job, `[JOB] ${id}`);
+    log(job, `[MODE] ${mode}`);
+    log(job, `[ENTRY] ${entry}`);
+    log(job, "[EXTRACTING ZIP]");
 
     await fs.createReadStream(req.file.path)
       .pipe(unzipper.Extract({ path: workdir }))
       .promise();
+
+    fs.rmSync(req.file.path, { force: true });
 
     const entryPath = path.join(workdir, entry);
 
     if (!fs.existsSync(entryPath)) {
       job.done = true;
       job.failed = true;
-      job.logs.push(`[ERROR] Entry file not found: ${entry}\n`);
+      log(job, `[ERROR] Entry file not found: ${entry}`);
       return res.json({ jobId: id });
     }
 
@@ -109,7 +123,7 @@ app.post("/compile", upload.single("project"), async (req, res) => {
 
     nuitkaArgs.push(entry);
 
-    job.logs.push(`[RUNNING] python ${nuitkaArgs.join(" ")}\n\n`);
+    log(job, `[RUNNING] python ${nuitkaArgs.join(" ")}`);
 
     const child = spawn("python", nuitkaArgs, {
       cwd: workdir,
@@ -122,44 +136,58 @@ app.post("/compile", upload.single("project"), async (req, res) => {
       }
     });
 
-    child.stdout.on("data", d => job.logs.push(d.toString()));
-    child.stderr.on("data", d => job.logs.push(d.toString()));
+    child.stdout.on("data", d => log(job!, d.toString()));
+    child.stderr.on("data", d => log(job!, d.toString()));
 
     child.on("error", err => {
-      job.logs.push(`\n[SPAWN ERROR] ${err.message}\n`);
-      job.done = true;
-      job.failed = true;
+      job!.failed = true;
+      job!.done = true;
+      log(job!, `[SPAWN ERROR] ${err.message}`);
     });
 
     child.on("close", async code => {
-      job.exitCode = code;
+      job!.exitCode = code;
 
       try {
         if (code !== 0) {
-          job.failed = true;
-          job.logs.push(`\n[FAILED] Nuitka exited with code ${code}\n`);
+          job!.failed = true;
+          log(job!, `[FAILED] Nuitka exited with code ${code}`);
         } else {
-          job.logs.push("\n[ZIPPING ARTIFACT]\n");
+          log(job!, "[ZIPPING ARTIFACT]");
           await zipDirectory(outdir, artifact);
-          job.artifact = artifact;
-          job.logs.push("\n[DONE]\n");
+          job!.artifact = artifact;
+          log(job!, "[DONE]");
         }
       } catch (err: any) {
-        job.failed = true;
-        job.logs.push(`\n[ZIP ERROR] ${err.message}\n`);
+        job!.failed = true;
+        log(job!, `[ZIP ERROR] ${err.message}`);
       }
 
-      job.done = true;
+      job!.done = true;
     });
 
-    res.json({ jobId: id, mode, logs: `wss://${req.hostname}/${id}`, download: `/download/${id}` });
+    return res.json({
+      jobId: id,
+      mode,
+      logs: `wss://${req.hostname}/${id}`,
+      status: `/status/${id}`,
+      download: `/download/${id}`
+    });
+
   } catch (err: any) {
-    res.status(500).send(err.message);
+    if (job) {
+      job.failed = true;
+      job.done = true;
+      log(job, `[SERVER ERROR] ${err.message}`);
+    }
+
+    return res.status(500).send(err.message);
   }
 });
 
 app.get("/status/:id", (req, res) => {
   const job = jobs.get(req.params.id);
+
   if (!job) return res.status(404).send("Job not found");
 
   res.json({
@@ -173,6 +201,7 @@ app.get("/status/:id", (req, res) => {
 
 app.get("/logs/:id", (req, res) => {
   const job = jobs.get(req.params.id);
+
   if (!job) return res.status(404).send("Job not found");
 
   res.type("text/plain").send(job.logs.join(""));
@@ -197,7 +226,11 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   const id = req.url?.split("/").filter(Boolean).pop();
-  if (!id) return ws.close();
+
+  if (!id) {
+    ws.send("Missing job id\n");
+    return ws.close();
+  }
 
   let cursor = 0;
 
@@ -220,4 +253,8 @@ wss.on("connection", (ws, req) => {
       ws.close();
     }
   }, 300);
+
+  ws.on("close", () => {
+    clearInterval(interval);
+  });
 });
