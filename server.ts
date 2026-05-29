@@ -11,9 +11,7 @@ const app = express();
 
 const upload = multer({
   dest: "/tmp/uploads",
-  limits: {
-    fileSize: 300 * 1024 * 1024
-  }
+  limits: { fileSize: 300 * 1024 * 1024 }
 });
 
 type Job = {
@@ -33,32 +31,42 @@ function log(job: Job, msg: string) {
 
 function safeEntry(entry: string) {
   entry = entry.trim();
-
-  if (!entry) throw new Error("Missing entry");
-  if (!entry.endsWith(".py")) throw new Error("Entry must be a .py file");
-  if (entry.includes("..")) throw new Error("Entry cannot contain ..");
-  if (path.isAbsolute(entry)) throw new Error("Entry cannot be absolute path");
-
+  if (!entry.endsWith(".py")) throw new Error("Entry must be .py");
+  if (entry.includes("..")) throw new Error("Invalid entry path");
+  if (path.isAbsolute(entry)) throw new Error("Invalid entry path");
   return entry;
 }
 
-async function zipDirectory(sourceDir: string, outputZip: string, job: Job) {
+async function runCommand(
+  job: Job,
+  command: string,
+  args: string[],
+  cwd: string,
+  env = process.env
+) {
+  log(job, `[RUN] ${command} ${args.join(" ")}`);
+
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("zip", ["-r", outputZip, "."], {
-      cwd: sourceDir,
-      shell: false
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      env
     });
 
     child.stdout.on("data", d => log(job, d.toString()));
     child.stderr.on("data", d => log(job, d.toString()));
 
-    child.on("error", reject);
+    child.on("error", err => reject(err));
 
     child.on("close", code => {
       if (code === 0) resolve();
-      else reject(new Error(`zip exited with code ${code}`));
+      else reject(new Error(`${command} exited with code ${code}`));
     });
   });
+}
+
+async function zipDirectory(job: Job, sourceDir: string, outputZip: string) {
+  await runCommand(job, "zip", ["-r", outputZip, "."], sourceDir);
 }
 
 app.post("/compile", upload.single("project"), async (req, res) => {
@@ -93,7 +101,13 @@ app.post("/compile", upload.single("project"), async (req, res) => {
     log(job, `[JOB] ${id}`);
     log(job, `[MODE] ${mode}`);
     log(job, `[ENTRY] ${entry}`);
-    log(job, "[EXTRACTING ZIP]");
+
+    log(job, "\n=== CPU / MEMORY INFO ===");
+    await runCommand(job, "bash", ["-lc", "nproc; lscpu | head -40; echo; free -h; echo; df -h /tmp"], workdir).catch(e => {
+      log(job!, `[CPU INFO ERROR] ${e.message}`);
+    });
+
+    log(job, "\n=== EXTRACTING ZIP ===");
 
     await fs.createReadStream(req.file.path)
       .pipe(unzipper.Extract({ path: workdir }))
@@ -110,10 +124,30 @@ app.post("/compile", upload.single("project"), async (req, res) => {
       return res.json({ jobId: id });
     }
 
+    const reqPath = path.join(workdir, "requirements.txt");
+
+    if (fs.existsSync(reqPath)) {
+      log(job, "\n=== INSTALLING REQUIREMENTS ===");
+
+      await runCommand(job, "python", [
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "-r",
+        "requirements.txt"
+      ], workdir);
+    } else {
+      log(job, "\n[NO requirements.txt FOUND]");
+    }
+
+    log(job, "\n=== STARTING NUITKA ===");
+
     const nuitkaArgs = [
       "-m",
       "nuitka",
       "--standalone",
+      "--follow-imports",
       "--jobs=1",
       "--remove-output",
       `--output-dir=${outdir}`
@@ -125,8 +159,6 @@ app.post("/compile", upload.single("project"), async (req, res) => {
     }
 
     nuitkaArgs.push(entry);
-
-    log(job, `[RUNNING] python ${nuitkaArgs.join(" ")}`);
 
     const child = spawn("python", nuitkaArgs, {
       cwd: workdir,
@@ -156,14 +188,14 @@ app.post("/compile", upload.single("project"), async (req, res) => {
           job!.failed = true;
           log(job!, `[FAILED] Nuitka exited with code ${code}`);
         } else {
-          log(job!, "[ZIPPING ARTIFACT]");
-         await zipDirectory(outdir, artifact, job!);
+          log(job!, "\n=== ZIPPING ARTIFACT ===");
+          await zipDirectory(job!, outdir, artifact);
           job!.artifact = artifact;
-          log(job!, "[DONE]");
+          log(job!, "\n[DONE]");
         }
       } catch (err: any) {
         job!.failed = true;
-        log(job!, `[ZIP ERROR] ${err.message}`);
+        log(job!, `[ARTIFACT ERROR] ${err.message}`);
       }
 
       job!.done = true;
@@ -176,7 +208,6 @@ app.post("/compile", upload.single("project"), async (req, res) => {
       status: `/status/${id}`,
       download: `/download/${id}`
     });
-
   } catch (err: any) {
     if (job) {
       job.failed = true;
@@ -190,7 +221,6 @@ app.post("/compile", upload.single("project"), async (req, res) => {
 
 app.get("/status/:id", (req, res) => {
   const job = jobs.get(req.params.id);
-
   if (!job) return res.status(404).send("Job not found");
 
   res.json({
@@ -204,10 +234,21 @@ app.get("/status/:id", (req, res) => {
 
 app.get("/logs/:id", (req, res) => {
   const job = jobs.get(req.params.id);
-
   if (!job) return res.status(404).send("Job not found");
 
   res.type("text/plain").send(job.logs.join(""));
+});
+
+app.get("/jobs", (req, res) => {
+  res.json(
+    Array.from(jobs.values()).map(j => ({
+      id: j.id,
+      done: j.done,
+      failed: j.failed,
+      exitCode: j.exitCode,
+      hasArtifact: !!j.artifact
+    }))
+  );
 });
 
 app.get("/download/:id", (req, res) => {
@@ -251,13 +292,11 @@ wss.on("connection", (ws, req) => {
       cursor++;
     }
 
-    if (job.done) {
+    if (job.done && cursor >= job.logs.length) {
       clearInterval(interval);
       ws.close();
     }
   }, 300);
 
-  ws.on("close", () => {
-    clearInterval(interval);
-  });
+  ws.on("close", () => clearInterval(interval));
 });
